@@ -1,17 +1,13 @@
 #include <iostream>
 #include <string>
 #include <vector>
-#include <algorithm>
 #include <filesystem>
-
-#ifdef _WIN32
-#include <windows.h>
-#endif
+#include <readline/readline.h>
+#include <readline/history.h>
 
 #include "Config.h"
 #include "Types.h"
 #include "SessionManager.h"
-#include "ToolDispatcher.h"
 #include "HttpClient.h"
 #include "OpenRouterClient.h"
 #include "ContextCompactor.h"
@@ -19,97 +15,246 @@
 
 using namespace micro_harness;
 
-// ── Usage message ─────────────────────────────────────────────────────────
+// ── Usage ──────────────────────────────────────────────────────────────────
 
 void printUsage(const char* prog) {
     std::cerr << "micro-harness v" << Constants::APP_VERSION << "\n\n"
-              << "A lightweight C++ agent harness for free AI models.\n\n"
+              << "A lightweight terminal chat client for LLM APIs.\n\n"
               << "Usage:\n"
-              << "  " << prog << " --session <name>    Start a new session\n"
-              << "  " << prog << " --sessions           List all available sessions\n"
-              << "  " << prog << " --resume <name>      Resume an existing session\n"
-              << "  " << prog << " --help               Show this help message\n\n"
+              << "  " << prog << " --session <name>    Start or resume an interactive session\n"
+              << "  " << prog << " --resume <name>     Resume an existing session (interactive)\n"
+              << "  " << prog << " --message <text>    CLI mode: send a message and print the response\n"
+              << "  " << prog << " --sessions         List all sessions\n"
+              << "  " << prog << " --help             Show this help\n\n"
+              << "CLI mode options (--message):\n"
+              << "  " << prog << " --message <text> [--session <name>]\n"
+              << "  " << prog << " -m <text> [--thinking]\n"
+              << "  --thinking         Include reasoning in CLI output (default: hidden)\n\n"
               << "Environment variables:\n"
-              << "  OPENROUTER_API_KEY                  Set to use OpenRouter (omit for free/no-auth mode)\n"
-              << "  MICRO_HARNESS_MODEL                  Model name (default: " << Constants::FREE_MODEL << ")\n"
-              << "  MICRO_HARNESS_BASE_URL               API base URL override\n"
-              << "  MICRO_HARNESS_SESSIONS_DIR           Sessions directory (default: ~/.micro-harness)\n"
-              << "  MICRO_HARNESS_SYSTEM_PROMPT          System prompt text\n"
-              << "  MICRO_HARNESS_SYSTEM_PROMPT_FILE     Path to file containing system prompt\n"
-              << "  MICRO_HARNESS_WORK_DIR                  Restrict file tools to this directory\n"
-              << "  MICRO_HARNESS_VERBOSE                Enable verbose logging (1/true)\n"
-              << "\n"
-              << "By default, uses the opencode provider (free, no API key needed).\n"
-              << "Set OPENROUTER_API_KEY to switch to OpenRouter (authenticated mode).\n";
+              << "  OPENROUTER_API_KEY           API key (switches to OpenRouter)\n"
+              << "  MICRO_HARNESS_MODEL          Model name\n"
+              << "  MICRO_HARNESS_BASE_URL       API base URL override\n"
+              << "  MICRO_HARNESS_SESSIONS_DIR   Sessions directory\n"
+              << "  MICRO_HARNESS_SYSTEM_PROMPT  System prompt text\n"
+              << "  MICRO_HARNESS_SYSTEM_PROMPT_FILE  System prompt file\n"
+              << "  MICRO_HARNESS_VERBOSE        Enable debug logging (1/true)\n";
 }
 
-// ── List sessions ─────────────────────────────────────────────────────────
+// ── Markdown to terminal ────────────────────────────────────────────────────
+
+std::string formatMarkdown(const std::string& text) {
+    std::string out;
+    out.reserve(text.size() * 2);
+
+    for (size_t i = 0; i < text.size(); ++i) {
+        // **bold** or __bold__
+        if (i + 1 < text.size() && text[i] == '*' && text[i + 1] == '*') {
+            size_t end = text.find("**", i + 2);
+            if (end != std::string::npos) {
+                out += "\033[1m";
+                out.append(text, i + 2, end - i - 2);
+                out += "\033[22m";
+                i = end + 1;
+                continue;
+            }
+        }
+        if (i + 1 < text.size() && text[i] == '_' && text[i + 1] == '_') {
+            size_t end = text.find("__", i + 2);
+            if (end != std::string::npos) {
+                out += "\033[1m";
+                out.append(text, i + 2, end - i - 2);
+                out += "\033[22m";
+                i = end + 1;
+                continue;
+            }
+        }
+
+        // `inline code`
+        if (text[i] == '`') {
+            size_t end = text.find('`', i + 1);
+            if (end != std::string::npos) {
+                out += "\033[36m";
+                out.append(text, i + 1, end - i - 1);
+                out += "\033[0m";
+                i = end;
+                continue;
+            }
+        }
+
+        // ~~strikethrough~~
+        if (i + 1 < text.size() && text[i] == '~' && text[i + 1] == '~') {
+            size_t end = text.find("~~", i + 2);
+            if (end != std::string::npos) {
+                out += "\033[9m";
+                out.append(text, i + 2, end - i - 2);
+                out += "\033[29m";
+                i = end + 1;
+                continue;
+            }
+        }
+
+        // *italic* (single star)
+        if (text[i] == '*' && (i + 1 >= text.size() || text[i + 1] != '*')) {
+            size_t end = text.find('*', i + 1);
+            if (end != std::string::npos && (end + 1 >= text.size() || text[end + 1] != '*')) {
+                out += "\033[3m";
+                out.append(text, i + 1, end - i - 1);
+                out += "\033[23m";
+                i = end;
+                continue;
+            }
+        }
+
+        // _italic_ (single underscore)
+        if (text[i] == '_' && (i + 1 >= text.size() || text[i + 1] != '_')) {
+            size_t end = text.find('_', i + 1);
+            if (end != std::string::npos && (end + 1 >= text.size() || text[end + 1] != '_')) {
+                out += "\033[3m";
+                out.append(text, i + 1, end - i - 1);
+                out += "\033[23m";
+                i = end;
+                continue;
+            }
+        }
+
+        out += text[i];
+    }
+
+    return out;
+}
+
+// ── Display state ───────────────────────────────────────────────────────────
+
+struct DisplayState {
+    bool showThinking = true;
+    bool reasoningOpen = false;
+    bool spinnerActive = false;
+    int spinnerFrame = 0;
+    bool cliMode = false;
+    std::string cliReasoningBuffer;
+    std::string cliContentBuffer;
+};
+
+static const char* spinnerFrames[] = {
+    "\xe2\xa0\x8b", "\xe2\xa1\x99", "\xe2\xa1\xb9", "\xe2\xa1\xb8",
+    "\xe2\xa3\xbc", "\xe2\xa3\xb4", "\xe2\xa2\xa6", "\xe2\xa2\xa7",
+    "\xe2\xa0\x87", "\xe2\xa0\x8f"
+};
+static constexpr int spinnerFrameCount = 10;
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
 
 void listSessions(SessionManager& sessions) {
     std::vector<Session> all = sessions.listSessions();
     if (all.empty()) {
-        std::cout << "No sessions found." << std::endl;
+        std::cout << "No sessions found.\n";
         return;
     }
 
     std::cout << "Available sessions (" << all.size() << "):\n\n";
     for (const auto& s : all) {
         std::cout << "  Name:       " << s.name << "\n"
-                  << "  ID:         " << s.id << "\n"
                   << "  Created:    " << s.createdAt << "\n"
                   << "  Updated:    " << s.updatedAt << "\n"
-                  << "  Messages:   " << s.history.size() << "\n"
-                  << std::endl;
+                  << "  Messages:   " << s.history.size() << "\n\n";
     }
 }
-
-// ── Interactive prompt ────────────────────────────────────────────────────
 
 std::string promptUser() {
-    if (std::cin.eof()) {
+    char* line = readline("> ");
+    if (line == nullptr) {
+        std::cout << "\n";
         return "/exit";
     }
-    std::cout << "\n> " << std::flush;
-    std::string line;
-    std::getline(std::cin, line);
-    if (std::cin.fail()) {
-        return "/exit";
+    std::string result(line);
+    free(line);
+
+    if (!result.empty()) {
+        add_history(result.c_str());
     }
-    return line;
+
+    return result;
 }
 
-// ── Run interactive loop ──────────────────────────────────────────────────
+void printSessionHeader(const Session& session, const std::string& action) {
+    std::cout << action << " session: " << session.name << "\n"
+              << "Messages in history: " << session.history.size() << "\n";
 
-void runInteractive(AgentLoop& agent, SessionManager& sessions, Session& session, bool verbose) {
-    std::cout << "\nMicro-Harness interactive session [" << session.name << "]\n"
-              << "Type /help for available commands.\n"
-              << std::flush;
+    if (!session.history.empty()) {
+        std::cout << "\nRecent history:\n";
+        const size_t showLast = 6;
+        size_t start = session.history.size() > showLast
+                          ? session.history.size() - showLast : 0;
 
-    auto printHelp = []() {
-        std::cout << "\nAvailable commands:\n"
-                  << "  /exit      Save and quit the session\n"
-                  << "  /quit      Alias for /exit\n"
-                  << "  /save      Persist the session to disk\n"
-                  << "  /sessions  List all saved sessions\n"
-                  << "  /help      Show this help message\n"
-                  << std::flush;
-    };
+        if (start > 0) {
+            std::cout << "  ... (" << start << " earlier message"
+                      << (start != 1 ? "s" : "") << " omitted)\n";
+        }
 
+        for (size_t i = start; i < session.history.size(); ++i) {
+            const auto& msg = session.history[i];
+            const char* role = "unknown";
+            switch (msg.role) {
+                case MessageRole::System:    role = "system";    break;
+                case MessageRole::User:      role = "user";      break;
+                case MessageRole::Assistant: role = "assistant"; break;
+            }
+
+            std::string content = msg.content;
+            if (content.size() > 120) {
+                content = content.substr(0, 120) + "...";
+            }
+
+            std::cout << "  [" << role << "] " << content << "\n";
+        }
+        std::cout << "\n";
+    }
+
+    std::cout << "Type /help for commands.\n" << std::flush;
+}
+
+std::string extractSessionName(const std::string& input, size_t prefixLen) {
+    std::string name = input.substr(prefixLen);
+    while (!name.empty() && (name.front() == ' ' || name.front() == '\t' || name.front() == '\r'))
+        name.erase(name.begin());
+    while (!name.empty() && (name.back() == ' ' || name.back() == '\t' || name.back() == '\r'))
+        name.pop_back();
+    return name;
+}
+
+// ── Readline history ─────────────────────────────────────────────────────────
+
+static void loadHistory(const std::string& sessionsDir) {
+    using_history();
+    std::filesystem::path histPath = std::filesystem::path(sessionsDir) / "history";
+    if (std::filesystem::exists(histPath)) {
+        read_history(histPath.string().c_str());
+    }
+}
+
+static void saveHistory(const std::string& sessionsDir) {
+    std::filesystem::path histPath = std::filesystem::path(sessionsDir) / "history";
+    write_history(histPath.string().c_str());
+}
+
+// ── Interactive loop ────────────────────────────────────────────────────────
+
+void runInteractive(AgentLoop& agent, SessionManager& sessions, Session& session,
+                    DisplayState& display) {
     while (true) {
         std::string input = promptUser();
 
         if (input.empty()) continue;
 
-        // Handle commands
         if (input == "/exit" || input == "/quit") {
             sessions.persistSession(session);
-            std::cout << "Session saved. Goodbye!" << std::endl;
+            std::cout << "Session saved. Goodbye!\n";
             break;
         }
 
         if (input == "/save") {
             sessions.persistSession(session);
-            std::cout << "Session saved." << std::endl;
+            std::cout << "Session saved.\n";
             continue;
         }
 
@@ -118,297 +263,291 @@ void runInteractive(AgentLoop& agent, SessionManager& sessions, Session& session
             continue;
         }
 
-        if (input == "/help") {
-            printHelp();
+        if (input == "/thinking") {
+            display.showThinking = !display.showThinking;
+            std::cout << "Thinking display: " << (display.showThinking ? "ON" : "OFF") << "\n";
             continue;
         }
 
-        // Run the agent
+        if (input == "/help") {
+            std::cout << "\n"
+                      << "  /exit, /quit       — Save and quit the session\n"
+                      << "  /save              — Persist the session to disk\n"
+                      << "  /sessions          — List all saved sessions\n"
+                      << "  /session <name>    — Create or switch to a session\n"
+                      << "  /resume <name>     — Alias for /session <name>\n"
+                      << "  /thinking          — Toggle thinking display (on/off)\n"
+                      << "  /help              — Show this help message\n"
+                      << std::flush;
+            continue;
+        }
+
+        // /session <name> and /resume <name> — create or switch
+        {
+            size_t prefixLen = 0;
+            if (input.starts_with("/session ")) {
+                prefixLen = 9;
+            } else if (input.starts_with("/resume ")) {
+                prefixLen = 8;
+            }
+
+            if (prefixLen > 0) {
+                std::string newName = extractSessionName(input, prefixLen);
+
+                if (newName.empty()) {
+                    std::cout << "Usage: /session <name>\n";
+                } else if (!SessionManager::isValidName(newName)) {
+                    std::cout << "Invalid session name.\n";
+                } else {
+                    sessions.persistSession(session);
+
+                    if (sessions.sessionExists(newName)) {
+                        session = sessions.loadSession(newName);
+                    } else {
+                        session = sessions.createSession(newName);
+                    }
+
+                    printSessionHeader(session, "Switched to");
+                }
+                continue;
+            }
+        }
+
+        if (input == "/session" || input == "/resume") {
+            std::cout << "Usage: /session <name>\n";
+            continue;
+        }
+
         try {
-            std::vector<Message> history = agent.runWithSession(input, session);
-            std::cout << std::endl;  // Newline after response
+            agent.runWithSession(input, session);
+            std::cout << std::endl;
         } catch (const Error& e) {
-            std::cerr << "\n[Error: " << e.message << "]" << std::endl;
+            std::cerr << "\n[Error: " << e.message << "]\n";
             if (!e.isRetryable) break;
         } catch (const std::exception& e) {
-            std::cerr << "\n[Unexpected error: " << e.what() << "]" << std::endl;
+            std::cerr << "\n[Unexpected error: " << e.what() << "]\n";
             break;
         }
     }
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────
+// ── Main ────────────────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        printUsage(argv[0]);
-        return 1;
+    std::string sessionName;
+    std::string message;
+    bool resumeFlag = false;
+    bool showSessions = false;
+    bool showHelp = false;
+    bool cliThinking = false;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--help" || arg == "-h") {
+            showHelp = true;
+        } else if (arg == "--sessions") {
+        showSessions = true;
+        } else if (arg == "--session") {
+            if (i + 1 >= argc) { std::cerr << "Error: --session requires a name\n"; return 1; }
+            sessionName = argv[++i];
+        } else if (arg == "--resume") {
+            if (i + 1 >= argc) { std::cerr << "Error: --resume requires a name\n"; return 1; }
+            sessionName = argv[++i];
+            resumeFlag = true;
+        } else if (arg == "--message" || arg == "-m") {
+            if (i + 1 >= argc) { std::cerr << "Error: --message requires a value\n"; return 1; }
+            message = argv[++i];
+        } else if (arg == "--thinking") {
+            cliThinking = true;
+        } else {
+            std::cerr << "Error: Unknown argument: " << arg << "\n";
+            printUsage(argv[0]);
+            return 1;
+        }
     }
 
-    const std::string arg1 = argv[1];
-
-    if (arg1 == "--help" || arg1 == "-h") {
+    if (showHelp) {
         printUsage(argv[0]);
         return 0;
     }
 
-    // Set UTF-8 encoding and enable ANSI escape sequences on Windows
-#ifdef _WIN32
-    SetConsoleOutputCP(65001);
-    SetConsoleCP(65001);
-    // Enable ANSI escape sequence processing (colors, bold, italic, etc.)
-    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (hOut != INVALID_HANDLE_VALUE) {
-        DWORD dwMode = 0;
-        if (GetConsoleMode(hOut, &dwMode)) {
-            dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-            SetConsoleMode(hOut, dwMode);
-        }
-    }
-#endif
-
-    // Load configuration
     Config config;
     const AgentConfig& cfg = config.get();
 
     if (cfg.verbose) {
-        std::cerr << "[micro-harness] Base URL: " << cfg.baseUrl << std::endl;
-        std::cerr << "[micro-harness] Model: " << cfg.model << std::endl;
-        std::cerr << "[micro-harness] Sessions dir: " << cfg.sessionsDir << std::endl;
-        std::cerr << "[micro-harness] Auth mode: "
-                  << (cfg.apiKey.empty() ? "free/no-auth (opencode provider)" : "authenticated (OpenRouter)")
-                  << std::endl;
-
-        // Show system prompt preview (first line or first 80 chars)
-        if (!cfg.systemPrompt.empty()) {
-            std::string preview = cfg.systemPrompt.substr(0, 80);
-            // Replace newlines with spaces for a single-line preview
-            for (auto& ch : preview) {
-                if (ch == '\n') ch = ' ';
-            }
-            std::cerr << "[micro-harness] System prompt: " << preview;
-            if (cfg.systemPrompt.size() > 80) {
-                std::cerr << "... (" << cfg.systemPrompt.size() << " chars)";
-            }
-            std::cerr << std::endl;
-        }
+        std::cerr << "[micro-harness] Base URL: " << cfg.baseUrl << "\n"
+                  << "[micro-harness] Model: " << cfg.model << "\n"
+                  << "[micro-harness] Sessions dir: " << cfg.sessionsDir << "\n"
+                  << "[micro-harness] Auth: "
+                  << (cfg.apiKey.empty() ? "free (OpenCode provider)" : "authenticated (OpenRouter)")
+                  << "\n";
     }
 
-    // Create components
     SessionManager sessions(cfg.sessionsDir);
-    ToolDispatcher tools;
-
-    // Set the restricted working directory for file tools.
-    // Defaults to the actual CWD; overridable via MICRO_HARNESS_WORK_DIR.
-    {
-        const char* workDirEnv = std::getenv("MICRO_HARNESS_WORK_DIR");
-        const std::string dir = (workDirEnv && workDirEnv[0] != '\0')
-                                    ? workDirEnv
-                                    : std::filesystem::current_path().string();
-        ToolDispatcher::setWorkDir(dir);
-        if (cfg.verbose) {
-            std::cerr << "[micro-harness] Work dir: "
-                      << ToolDispatcher::getWorkDir() << std::endl;
-        }
-    }
-
     HttpClient httpClient(cfg.baseUrl, cfg.apiKey, cfg.verbose);
     OpenRouterClient openRouter(cfg);
     ContextCompactor compactor(cfg, openRouter);
+    AgentLoop agent(cfg, sessions, openRouter, compactor);
 
-    // Set up output callbacks
-    auto agent = std::make_unique<AgentLoop>(cfg, sessions, tools, openRouter, compactor);
+    DisplayState display;
 
-    // Reasoning display state: tracks whether the reasoning block is open
-    // so we can close it when content starts arriving (streaming mode).
-    struct ReasoningState {
-        bool inReasoning = false;
-    };
-    auto reasoningState = std::make_shared<ReasoningState>();
-
-    agent->setOutputCallback([reasoningState](const std::string& text) {
-        // If reasoning block is still open, close it before content
-        if (reasoningState->inReasoning) {
-            reasoningState->inReasoning = false;
-            std::cout << "\n\033[2m─────────────────\033[0m\n\n";
+    // Reasoning callback: either show reasoning block or spinner
+    agent.setReasoningCallback([&display](const std::string& reasoning) {
+        if (display.cliMode) {
+            display.spinnerActive = true;
+            std::cout << "\r\033[2mThinking "
+                      << spinnerFrames[display.spinnerFrame++ % spinnerFrameCount]
+                      << "\033[0m" << std::flush;
+            if (display.showThinking) {
+                display.cliReasoningBuffer += reasoning;
+            }
+            return;
         }
 
-        // Apply ANSI formatting to inline markdown syntax
-        std::string out;
-        out.reserve(text.size() * 2);
-
-        for (size_t i = 0; i < text.size(); ++i) {
-            // **bold**
-            if (text[i] == '*' && i + 1 < text.size() && text[i + 1] == '*') {
-                size_t end = text.find("**", i + 2);
-                if (end != std::string::npos) {
-                    out += "\033[1m";
-                    out.append(text, i + 2, end - i - 2);
-                    out += "\033[22m";
-                    i = end + 1;
-                    continue;
-                }
+        if (display.showThinking) {
+            if (!display.reasoningOpen) {
+                display.reasoningOpen = true;
+                std::cout << "\n\033[2m─── Reasoning ───\033[0m\n";
             }
-
-            // `inline code`
-            if (text[i] == '`') {
-                size_t end = text.find('`', i + 1);
-                if (end != std::string::npos) {
-                    out += "\033[36m";
-                    out.append(text, i + 1, end - i - 1);
-                    out += "\033[0m";
-                    i = end;
-                    continue;
-                }
-            }
-
-            // ~~strikethrough~~
-            if (text[i] == '~' && i + 1 < text.size() && text[i + 1] == '~') {
-                size_t end = text.find("~~", i + 2);
-                if (end != std::string::npos) {
-                    out += "\033[9m";
-                    out.append(text, i + 2, end - i - 2);
-                    out += "\033[29m";
-                    i = end + 1;
-                    continue;
-                }
-            }
-
-            // *italic* (single star, not followed by '*')
-            if (text[i] == '*' && (i + 1 >= text.size() || text[i + 1] != '*')) {
-                size_t end = text.find('*', i + 1);
-                if (end != std::string::npos && (end + 1 >= text.size() || text[end + 1] != '*')) {
-                    out += "\033[3m";
-                    out.append(text, i + 1, end - i - 1);
-                    out += "\033[23m";
-                    i = end;
-                    continue;
-                }
-            }
-
-            out += text[i];
-        }
-
-        std::cout << out << std::flush;
-    });
-
-    // Reasoning callback: display reasoning traces in a styled block
-    agent->setReasoningCallback([reasoningState](const std::string& reasoning) {
-        if (!reasoningState->inReasoning) {
-            reasoningState->inReasoning = true;
-            std::cout << "\n\033[2m─── Reasoning ───\033[0m\n";
-        }
-        std::cout << "\033[2m" << reasoning << "\033[0m" << std::flush;
-    });
-
-    // Default: if no content arrives after reasoning (pure reasoning model),
-    // close block after a small delay or at end of turn. We handle this by
-    // checking reasoningState in the main loop (see runInteractive).
-
-    const bool verbose = cfg.verbose;
-    agent->setToolCallCallback([verbose](const std::string& name, const std::string& args) {
-        if (verbose) {
-            std::cerr << "[Tool call] " << name << ": " << args << std::endl;
-        }
-    });
-    agent->setToolResultCallback([verbose](const std::string& toolName, const std::string& result) {
-        if (verbose) {
-            std::cerr << "[Tool result] " << toolName << ": " << result.substr(0, 200) << "..." << std::endl;
+            std::cout << "\033[2m" << reasoning << "\033[0m" << std::flush;
+        } else {
+            display.spinnerActive = true;
+            std::cout << "\r\033[2mThinking "
+                      << spinnerFrames[display.spinnerFrame++ % spinnerFrameCount]
+                      << "\033[0m" << std::flush;
         }
     });
 
-    // ── --sessions: list all ──────────────────────────────────────────────
-    if (arg1 == "--sessions") {
+    // Output callback: closes reasoning/spinner, prints formatted content
+    agent.setOutputCallback([&display](const std::string& text) {
+        if (display.cliMode) {
+            display.cliContentBuffer += text;
+            if (display.spinnerActive) {
+                display.spinnerActive = false;
+                std::cout << "\r\033[2K";
+            }
+            return;
+        }
+
+        if (display.reasoningOpen) {
+            display.reasoningOpen = false;
+            if (display.cliMode) {
+                std::cout << "\n──\n\n";
+            } else {
+                std::cout << "\n\033[2m─────────────────\033[0m\n\n";
+            }
+        }
+        if (display.spinnerActive) {
+            display.spinnerActive = false;
+            std::cout << "\r\033[2K";
+        }
+        std::cout << formatMarkdown(text) << std::flush;
+    });
+
+    loadHistory(cfg.sessionsDir);
+
+    // ── --sessions ──────────────────────────────────────────────────────
+    if (showSessions) {
         listSessions(sessions);
         return 0;
     }
 
-    // ── --session <name>: start new session ──────────────────────────────
-    if (arg1 == "--session") {
-        if (argc < 3) {
-            std::cerr << "Error: --session requires a name argument.\n";
-            return 1;
-        }
-        const std::string name = argv[2];
+    // ── CLI mode: --message <text> ──────────────────────────────────────
+    if (!message.empty()) {
+        display.cliMode = true;
+        display.showThinking = cliThinking;
+
+        std::string name = sessionName.empty() ? "default" : sessionName;
 
         try {
-            Session session = sessions.createSession(name);
-            std::cout << "Started new session: " << name << " (ID: " << session.id << ")\n";
-
-            // Get initial prompt, then enter interactive mode
-            std::cout << "\nEnter your first message:\n";
-            std::string prompt = promptUser();
-
-            if (!prompt.empty() && prompt[0] != '/') {
-                std::vector<Message> history = agent->runWithSession(prompt, session);
-                std::cout << std::endl;
-            } else if (!prompt.empty()) {
-                // A command was entered as first input — feed it to interactive mode
-                // by pushing it back conceptually. We simulate by entering
-                // runInteractive which will prompt again.
-                // The command will be handled there.
-            }
-
-            // Enter interactive mode (prints its own session header)
-            runInteractive(*agent, sessions, session, cfg.verbose);
-        } catch (const Error& e) {
-            std::cerr << "Error: " << e.message << std::endl;
-            return 1;
-        }
-
-        return 0;
-    }
-
-    // ── --resume <name>: resume existing session ─────────────────────────
-    if (arg1 == "--resume") {
-        if (argc < 3) {
-            std::cerr << "Error: --resume requires a name or ID argument.\n";
-            return 1;
-        }
-        const std::string name = argv[2];
-
-        try {
-            // Try to find session by name or ID
-            const std::vector<Session> all = sessions.listSessions();
-            Session session;
-            bool found = false;
-
-            // First try exact ID match
-            if (sessions.sessionExists(name)) {
-                session = sessions.loadSession(name);
-                found = true;
-            } else {
-                // Try name match
-                for (const auto& s : all) {
-                    if (s.name == name || s.id == name) {
-                        session = s;
-                        found = true;
-                        break;
-                    }
-                }
-            }
-
-            if (!found) {
-                std::cerr << "Error: Session not found: " << name << "\n";
-                std::cerr << "Use --sessions to list available sessions.\n";
+            if (resumeFlag && !sessions.sessionExists(name)) {
+                std::cerr << "Error: Session not found: " << name << "\n"
+                          << "Use --sessions to list available sessions.\n";
                 return 1;
             }
 
-            std::cout << "Resumed session: " << session.name
-                      << " (" << session.history.size() << " messages in history)\n";
+            Session session;
+            if (sessions.sessionExists(name)) {
+                session = sessions.loadSession(name);
+            } else {
+                session = sessions.createSession(name);
+            }
 
-            // Enter interactive mode (no initial prompt needed)
-            runInteractive(*agent, sessions, session, cfg.verbose);
+            agent.runWithSession(message, session);
+
+            if (display.spinnerActive) {
+                std::cout << "\r\033[2K";
+                display.spinnerActive = false;
+            }
+
+            if (display.showThinking && !display.cliReasoningBuffer.empty()) {
+                std::cout << "\n─── Reasoning ───\n"
+                          << display.cliReasoningBuffer
+                          << "\n──\n\n";
+            }
+
+            if (!display.cliContentBuffer.empty()) {
+                std::cout << formatMarkdown(display.cliContentBuffer) << std::flush;
+            }
+            std::cout << std::endl;
+
+            sessions.persistSession(session);
         } catch (const Error& e) {
-            std::cerr << "Error: " << e.message << std::endl;
+            std::cerr << "\n[Error: " << e.message << "]\n";
+            return 1;
+        } catch (const std::exception& e) {
+            std::cerr << "\n[Unexpected error: " << e.what() << "]\n";
             return 1;
         }
 
         return 0;
     }
 
-    // Unknown argument
-    std::cerr << "Error: Unknown argument: " << arg1 << "\n";
-    printUsage(argv[0]);
-    return 1;
+    // ── Interactive mode ────────────────────────────────────────────────
+    // Requires --session <name>
+    if (sessionName.empty()) {
+        std::cerr << "Error: --session <name> is required for interactive mode.\n";
+        printUsage(argv[0]);
+        return 1;
+    }
+
+    // ── --resume <name> ───────────────────────────────────────────────────
+    if (resumeFlag) {
+        if (!sessions.sessionExists(sessionName)) {
+            std::cerr << "Error: Session not found: " << sessionName << "\n"
+                      << "Use --sessions to list available sessions.\n";
+            return 1;
+        }
+
+        try {
+            Session session = sessions.loadSession(sessionName);
+            printSessionHeader(session, "Resumed");
+            runInteractive(agent, sessions, session, display);
+        } catch (const Error& e) {
+            std::cerr << "Error: " << e.message << "\n";
+            return 1;
+        }
+
+        saveHistory(cfg.sessionsDir);
+        return 0;
+    }
+
+    // ── --session <name>: start or resume ────────────────────────────────
+    if (!SessionManager::isValidName(sessionName)) {
+        std::cerr << "Error: Invalid session name: " << sessionName << "\n";
+        return 1;
+    }
+
+    try {
+        bool isNew = !sessions.sessionExists(sessionName);
+        Session session = sessions.createSession(sessionName);
+        printSessionHeader(session, isNew ? "Started new" : "Resumed");
+        runInteractive(agent, sessions, session, display);
+    } catch (const Error& e) {
+        std::cerr << "Error: " << e.message << "\n";
+        return 1;
+    }
+
+    saveHistory(cfg.sessionsDir);
+    return 0;
 }

@@ -1,8 +1,7 @@
 #include "ContextCompactor.h"
-#include <json/json.h>
 #include <sstream>
-#include <algorithm>
 #include <cmath>
+#include <iostream>
 
 namespace micro_harness {
 
@@ -10,219 +9,47 @@ ContextCompactor::ContextCompactor(const AgentConfig& config, OpenRouterClient& 
     : config_(config)
     , openRouter_(openRouter)
 {
-    settings_.enabled = config.compactEnabled;
-    settings_.reserveTokens = config.reserveTokens;
-    settings_.keepRecentTokens = config.keepRecentTokens;
 }
 
-// ── Token Estimation ─────────────────────────────────────────────────────
-
-size_t ContextCompactor::estimateTokenCount(const Message& msg) {
-    // Character-based heuristic: ~4 chars per token on average
+size_t ContextCompactor::estimateTokens(const Message& msg) {
     constexpr double CHARS_PER_TOKEN = 4.0;
-
-    switch (msg.role) {
-        case MessageRole::User:
-        case MessageRole::Tool:
-            return static_cast<size_t>(std::ceil(msg.content.size() / CHARS_PER_TOKEN));
-
-        case MessageRole::Assistant: {
-            size_t chars = msg.content.size();
-            for (const auto& tc : msg.toolCalls) {
-                chars += tc.name.size() + tc.arguments.size();
-            }
-            return static_cast<size_t>(std::ceil(chars / CHARS_PER_TOKEN));
-        }
-
-        case MessageRole::Compaction:
-            if (msg.compactionMeta) {
-                return static_cast<size_t>(std::ceil(
-                    msg.compactionMeta->summary.size() / CHARS_PER_TOKEN));
-            }
-            return static_cast<size_t>(std::ceil(msg.content.size() / CHARS_PER_TOKEN));
-
-        case MessageRole::System:
-        default:
-            return static_cast<size_t>(std::ceil(msg.content.size() / CHARS_PER_TOKEN));
-    }
+    size_t chars = msg.content.size() + msg.reasoningContent.size();
+    return static_cast<size_t>(std::ceil(chars / CHARS_PER_TOKEN));
 }
 
-ContextUsage ContextCompactor::estimateContextUsage(const std::vector<Message>& messages) {
-    ContextUsage usage;
-
+size_t ContextCompactor::estimateTotalTokens(const std::vector<Message>& messages) {
+    size_t total = 0;
     for (const auto& msg : messages) {
-        const size_t tokens = estimateTokenCount(msg);
-        usage.tokens += tokens;
+        total += estimateTokens(msg);
     }
-
-    // Find the last assistant message and compute trailing tokens
-    for (size_t i = messages.size(); i > 0; --i) {
-        if (messages[i - 1].role == MessageRole::Assistant) {
-            usage.lastUsageIndex = i - 1;
-            // Trailing tokens are everything after the last assistant message
-            for (size_t j = i; j < messages.size(); ++j) {
-                usage.trailingTokens += estimateTokenCount(messages[j]);
-            }
-            break;
-        }
-    }
-
-    return usage;
+    return total;
 }
 
-bool ContextCompactor::shouldCompact(const ContextUsage& usage,
-                                      size_t contextWindow,
-                                      const CompactSettings& settings)
-{
-    if (!settings.enabled) return false;
-    if (contextWindow == 0) return false;
-    return usage.tokens > (contextWindow - settings.reserveTokens);
+bool ContextCompactor::shouldCompact(const std::vector<Message>& messages) {
+    if (config_.maxContextTokens == 0) return false;
+    size_t total = estimateTotalTokens(messages);
+    return total > config_.maxContextTokens;
 }
-
-// ── Compaction Preparation ───────────────────────────────────────────────
-
-CompactPreparation ContextCompactor::prepareCompact(
-    const std::vector<Message>& history,
-    const CompactSettings& settings)
-{
-    CompactPreparation prep;
-
-    if (history.empty()) return prep;
-
-    // Find the last compaction message to get the previous summary
-    std::string previousSummary;
-    size_t compactionIndex = 0;
-    for (size_t i = 0; i < history.size(); ++i) {
-        if (history[i].role == MessageRole::Compaction && history[i].compactionMeta) {
-            previousSummary = history[i].compactionMeta->summary;
-            compactionIndex = i;
-        }
-    }
-
-    // Walk backward from the end, accumulating token estimates
-    size_t accumulated = 0;
-    size_t cutIndex = 0;
-
-    // Start from the compaction boundary or beginning
-    const size_t startIndex = compactionIndex > 0 ? compactionIndex + 1 : 0;
-
-    for (size_t i = history.size(); i > startIndex; --i) {
-        const size_t tokens = estimateTokenCount(history[i - 1]);
-        accumulated += tokens;
-        if (accumulated >= settings.keepRecentTokens) {
-            cutIndex = i - 1;
-            break;
-        }
-    }
-
-    // Ensure we don't cut at a tool result (keep paired with its call)
-    while (cutIndex > startIndex) {
-        if (history[cutIndex].role == MessageRole::Tool) {
-            // Tool results belong with their preceding assistant message
-            --cutIndex;
-        } else {
-            break;
-        }
-    }
-
-    prep.firstKeptIndex = cutIndex;
-
-    // Messages before cutIndex get summarized
-    for (size_t i = startIndex; i < prep.firstKeptIndex; ++i) {
-        if (history[i].role != MessageRole::Compaction) {
-            prep.messagesToSummarize.push_back(history[i]);
-        }
-    }
-
-    // Messages from cutIndex onward are retained
-    for (size_t i = prep.firstKeptIndex; i < history.size(); ++i) {
-        if (history[i].role != MessageRole::Compaction) {
-            prep.retainedTail.push_back(history[i]);
-        }
-    }
-
-    // Extract file operations from compacted messages
-    extractFileOps(prep.messagesToSummarize, prep.readFiles, prep.modifiedFiles);
-
-    // Estimate tokens before
-    ContextUsage usage = estimateContextUsage(history);
-    prep.tokensBefore = usage.tokens;
-    prep.previousSummary = previousSummary;
-
-    return prep;
-}
-
-// ── File Operation Extraction ────────────────────────────────────────────
-
-void ContextCompactor::extractFileOps(
-    const std::vector<Message>& messages,
-    std::set<std::string>& readFiles,
-    std::set<std::string>& modifiedFiles)
-{
-    for (const auto& msg : messages) {
-        if (msg.role != MessageRole::Assistant) continue;
-
-        for (const auto& tc : msg.toolCalls) {
-            // Parse arguments to extract path
-            Json::Value args;
-            Json::Reader reader;
-            if (!reader.parse(tc.arguments, args)) continue;
-
-            const std::string path = args.get("path", "").asString();
-            if (path.empty()) continue;
-
-            if (tc.name == "read") {
-                readFiles.insert(path);
-            } else if (tc.name == "write" || tc.name == "edit") {
-                modifiedFiles.insert(path);
-            } else if (tc.name == "bash") {
-                // Bash commands may read/modify files—we can't know statically.
-                // Track the command itself as context but no specific paths.
-            }
-        }
-    }
-}
-
-// ── Conversation Serialization ───────────────────────────────────────────
 
 std::string ContextCompactor::serializeConversation(const std::vector<Message>& messages) {
     std::ostringstream oss;
 
     for (const auto& msg : messages) {
         switch (msg.role) {
+            case MessageRole::System:
+                oss << "[System]: " << msg.content << "\n\n";
+                break;
             case MessageRole::User:
                 oss << "[User]: " << msg.content << "\n\n";
                 break;
-
             case MessageRole::Assistant:
                 if (!msg.content.empty()) {
                     oss << "[Assistant]: " << msg.content << "\n";
                 }
-                for (const auto& tc : msg.toolCalls) {
-                    oss << "[Assistant tool call]: " << tc.name
-                        << "(" << tc.arguments << ")\n";
+                if (!msg.reasoningContent.empty()) {
+                    oss << "[Reasoning]: " << msg.reasoningContent << "\n";
                 }
                 oss << "\n";
-                break;
-
-            case MessageRole::Tool:
-                oss << "[Tool result]: " << msg.content.substr(0, 2000);
-                if (msg.content.size() > 2000) {
-                    oss << "... [" << (msg.content.size() - 2000) << " more chars truncated]";
-                }
-                oss << "\n\n";
-                break;
-
-            case MessageRole::Compaction:
-                if (msg.compactionMeta) {
-                    oss << "[Compacted session context — "
-                        << msg.compactionMeta->tokensBefore << " tokens]\n"
-                        << msg.compactionMeta->summary << "\n\n";
-                }
-                break;
-
-            case MessageRole::System:
-                oss << "[System]: " << msg.content << "\n\n";
                 break;
         }
     }
@@ -230,25 +57,17 @@ std::string ContextCompactor::serializeConversation(const std::vector<Message>& 
     return oss.str();
 }
 
-// ── Summary Generation ───────────────────────────────────────────────────
-
 std::string ContextCompactor::generateSummary(
     const std::vector<Message>& messages,
     const std::string& previousSummary)
 {
-    const std::string conversation = serializeConversation(messages);
+    std::string prompt = "<conversation>\n" + serializeConversation(messages) + "\n</conversation>\n\n"
+                       + SUMMARIZATION_PROMPT;
 
-    std::string prompt;
-    if (previousSummary.empty()) {
-        prompt = "<conversation>\n" + conversation + "\n</conversation>\n\n"
-               + SUMMARIZATION_PROMPT;
-    } else {
-        prompt = "<conversation>\n" + conversation + "\n</conversation>\n\n"
-               + "<previous-summary>\n" + previousSummary + "\n</previous-summary>\n\n"
-               + UPDATE_SUMMARIZATION_PROMPT;
+    if (!previousSummary.empty()) {
+        prompt += "\n\n<previous-summary>\n" + previousSummary + "\n</previous-summary>\n";
     }
 
-    // Build a summarization request
     std::vector<Message> summaryMessages;
     Message systemMsg;
     systemMsg.role = MessageRole::System;
@@ -260,69 +79,50 @@ std::string ContextCompactor::generateSummary(
     userMsg.content = prompt;
     summaryMessages.push_back(userMsg);
 
-    // Send to the LLM for summarization
-    // We use the same OpenRouter client but with a reduced token limit for the summary
-    ChatResponse response = openRouter_.sendChatRequest(summaryMessages, {});
-
+    // Non-streaming request for summarization
+    ChatResponse response = openRouter_.sendChatRequest(summaryMessages);
     return response.text;
 }
 
-// ── Compaction Execution ─────────────────────────────────────────────────
+bool ContextCompactor::checkAndCompact(std::vector<Message>& messages) {
+    if (!shouldCompact(messages)) return false;
 
-CompactResult ContextCompactor::compact(const CompactPreparation& prep) {
-    CompactResult result;
-
-    if (prep.messagesToSummarize.empty() && prep.previousSummary.empty()) {
-        // Nothing to compact
-        result.tokensBefore = prep.tokensBefore;
-        result.retainedTail = prep.retainedTail;
-        return result;
+    // Keep the system message at index 0
+    size_t startIdx = 0;
+    if (!messages.empty() && messages[0].role == MessageRole::System) {
+        startIdx = 1;
     }
 
-    // Generate the summary
-    std::string summary = generateSummary(prep.messagesToSummarize, prep.previousSummary);
+    if (startIdx >= messages.size()) return false;
 
-    result.summary = summary;
-    result.tokensBefore = prep.tokensBefore;
-    result.retainedTail = prep.retainedTail;
-    result.readFiles = prep.readFiles;
-    result.modifiedFiles = prep.modifiedFiles;
+    // Collect messages to summarize (everything except system + last 2 messages)
+    size_t keepBack = 2;
+    if (messages.size() - startIdx <= keepBack) return false;
 
-    return result;
-}
+    std::vector<Message> toSummarize;
+    for (size_t i = startIdx; i < messages.size() - keepBack; ++i) {
+        toSummarize.push_back(messages[i]);
+    }
 
-bool ContextCompactor::checkAndCompact(std::vector<Message>& history) {
-    if (!settings_.enabled) return false;
+    if (toSummarize.empty()) return false;
 
-    ContextUsage usage = estimateContextUsage(history);
-    if (!shouldCompact(usage, config_.contextWindow, settings_)) {
+    // Generate summary
+    std::string summary;
+    try {
+        summary = generateSummary(toSummarize, lastSummary_);
+    } catch (const Error& e) {
+        std::cerr << "[micro-harness] Compaction failed: " << e.message << "\n";
         return false;
     }
 
-    CompactPreparation prep = prepareCompact(history, settings_);
-    if (prep.messagesToSummarize.empty()) {
-        return false;
-    }
+    lastSummary_ = summary;
 
-    CompactResult result = compact(prep);
-
-    // Build the compaction message
-    Message compactionMsg;
-    compactionMsg.role = MessageRole::Compaction;
-    auto meta = std::make_shared<Message::CompactionMeta>();
-    meta->summary = result.summary;
-    meta->tokensBefore = result.tokensBefore;
-    meta->readFiles = std::move(result.readFiles);
-    meta->modifiedFiles = std::move(result.modifiedFiles);
-    compactionMsg.compactionMeta = meta;
-    compactionMsg.content = "[Context auto-compacted: " + std::to_string(result.tokensBefore) + " tokens → summary]";
-
-    // Replace history with compaction message + retained tail
-    history.clear();
-    history.push_back(std::move(compactionMsg));
-    for (auto& msg : result.retainedTail) {
-        history.push_back(std::move(msg));
-    }
+    // Replace summarized messages with a single summary message
+    Message summaryMsg;
+    summaryMsg.role = MessageRole::System;
+    summaryMsg.content = "[Previous conversation summary]\n" + summary;
+    messages.erase(messages.begin() + startIdx, messages.begin() + messages.size() - keepBack);
+    messages.insert(messages.begin() + startIdx, summaryMsg);
 
     return true;
 }
