@@ -104,6 +104,8 @@ Command history is persisted in `<sessions-dir>/history` across runs.
 ```
 micro-harness/
 ├── CMakeLists.txt
+├── tests/
+│   └── test_cli.cpp           # Integration tests (separate executable)
 ├── src/
 │   ├── main.cpp            # CLI, interactive loop, markdown rendering
 │   ├── Config.cpp          # Environment variable resolution
@@ -121,3 +123,19 @@ micro-harness/
     ├── ContextCompactor.h
     └── AgentLoop.h
 ```
+
+## Testing
+
+```bash
+# Build both the app and the test executable
+mkdir build && cd build
+cmake ..
+make -j$(nproc)
+
+# Run tests
+ctest --verbose
+```
+
+Tests are built as a separate `test_cli` executable and exercise the CLI end-to-end
+against the `micro-harness` binary. Network access to the LLM API is required for
+the `--message` tests.

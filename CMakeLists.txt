@@ -31,4 +31,22 @@ add_executable(micro-harness ${SOURCES})
 target_include_directories(micro-harness PRIVATE ${INCLUDE_DIRS})
 target_link_libraries(micro-harness PRIVATE ${CURL_LIBRARIES} ${JSONCPP_LIBRARIES} ${READLINE_LIBRARIES})
 
+# ── Test suite ─────────────────────────────────────────────────────────────
+
+find_package(Threads REQUIRED)
+pkg_check_modules(GTEST REQUIRED gtest)
+pkg_check_modules(GTEST_MAIN REQUIRED gtest_main)
+
+add_executable(test_cli tests/test_cli.cpp)
+target_include_directories(test_cli PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_cli PRIVATE ${GTEST_LIBRARIES} ${GTEST_MAIN_LIBRARIES} Threads::Threads)
+
+# Pass the path to the main binary as a compile definition
+target_compile_definitions(test_cli PRIVATE MICRO_HARNESS_BIN="${CMAKE_BINARY_DIR}/micro-harness")
+
+enable_testing()
+add_test(NAME cli_tests COMMAND test_cli)
+
+# ── Install ──────────────────────────────────────────────────────────────────
+
 install(TARGETS micro-harness RUNTIME DESTINATION bin)
