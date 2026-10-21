@@ -1,4 +1,5 @@
 #include "HttpClient.h"
+#include "Config.h"
 #include <curl/curl.h>
 #include <iostream>
 #include <string>
@@ -34,7 +35,7 @@ struct curl_slist* HttpClient::buildHeaders() const {
     struct curl_slist* list = nullptr;
 
     list = curl_slist_append(list, "Content-Type: application/json");
-    list = curl_slist_append(list, "HTTP-Referer: https://github.com/user/micro-harness");
+    list = curl_slist_append(list, "HTTP-Referer: https://github.com/aldozorzi/micro-harness");
     list = curl_slist_append(list, "X-Title: micro-harness");
 
     if (!apiKey_.empty()) {
@@ -98,7 +99,8 @@ std::string HttpClient::doRequest(const std::string& url, const std::string* pos
         curl_easy_setopt(curl_, CURLOPT_VERBOSE, 1L);
     }
 
-    curl_easy_setopt(curl_, CURLOPT_USERAGENT, "micro-harness/1.0");
+    const std::string userAgent = std::string("micro-harness/") + Constants::APP_VERSION;
+    curl_easy_setopt(curl_, CURLOPT_USERAGENT, userAgent.c_str());
 
     if (postData) {
         curl_easy_setopt(curl_, CURLOPT_POST, 1L);
@@ -181,7 +183,8 @@ std::string HttpClient::sendPostRequestStreaming(
         curl_easy_setopt(curl_, CURLOPT_VERBOSE, 1L);
     }
 
-    curl_easy_setopt(curl_, CURLOPT_USERAGENT, "micro-harness/1.0");
+    const std::string userAgent = std::string("micro-harness/") + Constants::APP_VERSION;
+    curl_easy_setopt(curl_, CURLOPT_USERAGENT, userAgent.c_str());
     curl_easy_setopt(curl_, CURLOPT_POST, 1L);
     curl_easy_setopt(curl_, CURLOPT_POSTFIELDS, payload.c_str());
     curl_easy_setopt(curl_, CURLOPT_POSTFIELDSIZE, static_cast<long>(payload.size()));

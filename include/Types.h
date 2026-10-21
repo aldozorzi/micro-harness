@@ -55,7 +55,6 @@ struct AgentConfig {
     std::string model;
     std::string sessionsDir;
     std::string systemPrompt;
-    int maxTurns = 50;
     bool verbose = false;
     size_t maxContextTokens = 8192;
 };

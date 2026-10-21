@@ -1,6 +1,13 @@
 # micro-harness
 
-A lightweight terminal chat client for LLM APIs, designed to run on low-spec hardware.
+**v0.1.0**
+
+A lightweight terminal chat client for LLM APIs, designed to run on low-spec hardware
+and machines too old to comfortably open a browser.
+
+The harness is intentionally **single-turn**: you send one message, it streams one
+reply, and the conversation state is saved to disk. That keeps memory usage low and
+matches the back-and-forth workflow it was built for.
 
 ## Features
 
@@ -13,12 +20,36 @@ A lightweight terminal chat client for LLM APIs, designed to run on low-spec har
 - **Reasoning display**: Shows model reasoning chains in a styled block
 - **Context compaction**: Automatically summarizes old conversation history when approaching token limits
 
+## Requirements
+
+- Linux, macOS, or WSL
+- C++20 compiler (GCC 11+ or Clang 14+)
+- CMake 3.20+
+- `pkg-config`
+- `libcurl`
+- `jsoncpp`
+- GNU `readline`
+- GoogleTest (only if you build the tests)
+
+On Debian/Ubuntu:
+
+```bash
+sudo apt install build-essential cmake pkg-config \
+    libcurl4-openssl-dev libjsoncpp-dev libreadline-dev libgtest-dev
+```
+
 ## Build
 
 ```bash
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
+cmake -S . -B build
+cmake --build build -j$(nproc)
+```
+
+If GoogleTest is not installed, disable the test suite:
+
+```bash
+cmake -S . -B build -DBUILD_TESTING=OFF
+cmake --build build -j$(nproc)
 ```
 
 ## Usage
@@ -104,18 +135,19 @@ Command history is persisted in `<sessions-dir>/history` across runs.
 ```
 micro-harness/
 ├── CMakeLists.txt
+├── LICENSE
 ├── tests/
-│   └── test_cli.cpp           # Integration tests (separate executable)
+│   └── test_cli.cpp           # Offline CLI/service tests (+ opt-in network tests)
 ├── src/
-│   ├── main.cpp            # CLI, interactive loop, markdown rendering
-│   ├── Config.cpp          # Environment variable resolution
-│   ├── HttpClient.cpp      # libcurl HTTPS (streaming + non-streaming)
-│   ├── OpenRouterClient.cpp # API payload/response, SSE streaming
-│   ├── SessionManager.cpp  # JSON session persistence (name-keyed)
-│   ├── ContextCompactor.cpp # Token estimation + LLM summarization
-│   └── AgentLoop.cpp       # Conversation loop, trimming, streaming
+│   ├── main.cpp               # CLI, interactive loop, markdown rendering
+│   ├── Config.cpp             # Environment variable resolution
+│   ├── HttpClient.cpp         # libcurl HTTPS (streaming + non-streaming)
+│   ├── OpenRouterClient.cpp   # API payload/response, SSE streaming
+│   ├── SessionManager.cpp     # JSON session persistence (name-keyed)
+│   ├── ContextCompactor.cpp   # Token estimation + LLM summarization
+│   └── AgentLoop.cpp          # Single request/response turn, trimming, streaming
 └── include/
-    ├── Types.h             # Shared data structures
+    ├── Types.h                # Shared data structures
     ├── Config.h
     ├── HttpClient.h
     ├── OpenRouterClient.h
@@ -126,16 +158,31 @@ micro-harness/
 
 ## Testing
 
-```bash
-# Build both the app and the test executable
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
+Offline tests need no API key and no network:
 
-# Run tests
-ctest --verbose
+```bash
+cmake -S . -B build
+cmake --build build -j$(nproc)
+ctest --test-dir build --output-on-failure
 ```
 
-Tests are built as a separate `test_cli` executable and exercise the CLI end-to-end
-against the `micro-harness` binary. Network access to the LLM API is required for
-the `--message` tests.
+Tests that call the live LLM API are opt-in:
+
+```bash
+cmake -S . -B build -DMICRO_HARNESS_NETWORK_TESTS=ON
+cmake --build build -j$(nproc)
+ctest --test-dir build --output-on-failure
+```
+
+Network tests are best-effort: free models may be rate-limited, and not every model
+returns a reasoning trace.
+
+## Notes on the free provider
+
+The default configuration targets OpenCode's zen endpoint so the client works without
+an API key. This is a convenience endpoint and may change or be rate-limited over time.
+For stable usage, set `OPENROUTER_API_KEY` to use OpenRouter's authenticated API.
+
+## License
+
+Released under the [MIT License](LICENSE).

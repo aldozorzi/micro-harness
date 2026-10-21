@@ -1,4 +1,14 @@
 build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+Testing/
+Makefile
+*.o
+*.a
+*.so
 AGENTS.md
 IMPLEMENTATION.md
 TODO.md

@@ -9,7 +9,6 @@ namespace micro_harness {
 Config::Config() {
     config_.apiKey = "";
     config_.model = Constants::FREE_MODEL;
-    config_.maxTurns = Constants::DEFAULT_MAX_TURNS;
     config_.sessionsDir = defaultSessionsDir();
     config_.maxContextTokens = Constants::DEFAULT_CONTEXT_WINDOW;
     config_.verbose = false;
@@ -23,7 +22,6 @@ Config::Config() {
 
 Config::Config(const AgentConfig& overrides) : config_(overrides) {
     if (config_.model.empty()) config_.model = Constants::FREE_MODEL;
-    if (config_.maxTurns <= 0) config_.maxTurns = Constants::DEFAULT_MAX_TURNS;
     if (config_.sessionsDir.empty()) config_.sessionsDir = defaultSessionsDir();
     if (config_.baseUrl.empty()) config_.baseUrl = Constants::OPENCODE_BASE_URL;
 

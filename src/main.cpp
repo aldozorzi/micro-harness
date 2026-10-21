@@ -8,7 +8,6 @@
 #include "Config.h"
 #include "Types.h"
 #include "SessionManager.h"
-#include "HttpClient.h"
 #include "OpenRouterClient.h"
 #include "ContextCompactor.h"
 #include "AgentLoop.h"
@@ -384,7 +383,6 @@ int main(int argc, char* argv[]) {
     }
 
     SessionManager sessions(cfg.sessionsDir);
-    HttpClient httpClient(cfg.baseUrl, cfg.apiKey, cfg.verbose);
     OpenRouterClient openRouter(cfg);
     ContextCompactor compactor(cfg, openRouter);
     AgentLoop agent(cfg, sessions, openRouter, compactor);

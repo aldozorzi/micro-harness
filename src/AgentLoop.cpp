@@ -32,7 +32,7 @@ void AgentLoop::trimHistory(std::vector<Message>& messages) {
     }
 }
 
-bool AgentLoop::executeTurn(std::vector<Message>& messages) {
+void AgentLoop::executeTurn(std::vector<Message>& messages) {
     trimHistory(messages);
 
     // Check if compaction/summarization is needed
@@ -76,14 +76,14 @@ bool AgentLoop::executeTurn(std::vector<Message>& messages) {
         } else {
             std::cerr << "[Error: " << e.message << "]\n";
         }
-        return false;
+        return;
     } catch (const std::exception& e) {
         if (outputCb_) {
             outputCb_("[Exception: " + std::string(e.what()) + "]\n");
         } else {
             std::cerr << "[Exception: " << e.what() << "]\n";
         }
-        return false;
+        return;
     }
 
     // Add assistant response to history
@@ -92,8 +92,6 @@ bool AgentLoop::executeTurn(std::vector<Message>& messages) {
     assistantMsg.content = response.text;
     assistantMsg.reasoningContent = response.reasoningContent;
     messages.push_back(assistantMsg);
-
-    return false;
 }
 
 std::vector<Message> AgentLoop::run(const std::string& prompt) {
@@ -112,11 +110,7 @@ std::vector<Message> AgentLoop::run(const std::string& prompt) {
     session.history.push_back(userMsg);
     sessions_.persistSession(session);
 
-    for (int turns = 0; turns < config_.maxTurns; ++turns) {
-        if (!executeTurn(session.history)) {
-            break;
-        }
-    }
+    executeTurn(session.history);
 
     try {
         sessions_.persistSession(session);
@@ -144,11 +138,7 @@ std::vector<Message> AgentLoop::runWithSession(const std::string& prompt, Sessio
     userMsg.content = prompt;
     session.history.push_back(userMsg);
 
-    for (int turns = 0; turns < config_.maxTurns; ++turns) {
-        if (!executeTurn(session.history)) {
-            break;
-        }
-    }
+    executeTurn(session.history);
 
     try {
         sessions_.persistSession(session);

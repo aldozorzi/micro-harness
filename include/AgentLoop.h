@@ -36,7 +36,7 @@ private:
     OutputCallback outputCb_;
     ReasoningCallback reasoningCb_;
 
-    bool executeTurn(std::vector<Message>& messages);
+    void executeTurn(std::vector<Message>& messages);
     void trimHistory(std::vector<Message>& messages);
 };
 
